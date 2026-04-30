@@ -1,0 +1,34 @@
+# .github/workflows/grafana-auto-fix.yml
+name: Grafana Auto Fix
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub schedules use UTC. Adjust cadence/time for your team.
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  grafana-auto-fix:
+    name: Grafana Error Agent
+    uses: Maersk-Global/grafana-error-agent/.github/workflows/reusable-grafana-fix.yml@main
+    secrets:
+      GITHUB_PAT: ${{ secrets.GIT_PAT }}
+      # Dynamic auth for short-lived Grafana MCP bearer tokens.
+      GRAFANA_MCP_AUTH_CLIENT_ID: ${{ secrets.GRAFANA_MCP_AUTH_CLIENT_ID }}
+      GRAFANA_MCP_AUTH_CLIENT_SECRET: ${{ secrets.GRAFANA_MCP_AUTH_CLIENT_SECRET }}
+    with:
+      service_name: ${{ github.event.repository.name }}
+      grafana_dashboard_uid: ${{ vars.GRAFANA_DASHBOARD_UID }}
+      grafana_datasource_uid: ${{ vars.GRAFANA_DATASOURCE_UID }}
+      grafana_mcp_auth_token_url: ${{ vars.GRAFANA_MCP_AUTH_TOKEN_URL }}
+      grafana_mcp_auth_scope: ${{ vars.GRAFANA_MCP_AUTH_SCOPE }}
+      lookback_hours: 6
+      max_errors: 10
+      severity_filter: 'error'
+      create_issue: true
+      fail_on_errors: false

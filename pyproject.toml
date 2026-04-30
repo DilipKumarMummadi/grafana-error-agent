@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "grafana-error-agent"
+version = "0.1.0"
+description = "Grafana MCP error agent that creates Copilot-ready fix issues"
+authors = []
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.10"
+mcp = "^1.23.0"
+pydantic = "^2.11.7"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
