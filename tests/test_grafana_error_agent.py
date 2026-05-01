@@ -7,8 +7,13 @@ the agent can tolerate different Grafana MCP tool contracts.
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.grafana_error_agent import (
     GrafanaAgentConfig,
+    GrafanaError,
+    ErrorPatternAnalysis,
+    analyze_error_patterns,
     build_tool_arguments,
     collect_dashboard_loki_scan,
     mcp_request_headers,
@@ -93,7 +98,8 @@ def test_select_grafana_tool_prefers_error_log_tool():
     assert selected.name == "query_loki_logs"
 
 
-def test_build_tool_arguments_from_schema():
+def test_build_tool_arguments_from_schema(monkeypatch):
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     config = GrafanaAgentConfig(
         github_owner="test-org",
         github_repo="inventory-api",
@@ -232,3 +238,174 @@ def test_collect_dashboard_loki_scan_builds_namespace_query():
     assert scan["logql"] == (
         '{k8s_cluster="dev-cluster", namespace="stardom-core-dev"} |~ "(?i)(error|fatal)"'
     )
+
+
+# ---------------------------------------------------------------------------
+# analyze_error_patterns – Kafka SSL/TLS mismatch detection
+# ---------------------------------------------------------------------------
+
+def _make_kafka_ssl_error(index: int = 1) -> GrafanaError:
+    return GrafanaError(
+        key=f"kafka-ssl-{index}",
+        severity="ERROR",
+        title="SSL handshake failed",
+        message=(
+            f"sasl_ssl://broker-{index}.example.net:443/{index}: "
+            "SSL handshake failed: Disconnected: connecting to a PLAINTEXT broker "
+            "listener? (after 1ms in state SSL_HANDSHAKE)"
+        ),
+        service="stardom-globaladmin-bgservices",
+        source="grafana",
+    )
+
+
+def test_analyze_error_patterns_detects_kafka_ssl_mismatch():
+    errors = [_make_kafka_ssl_error(i) for i in range(1, 11)]
+
+    analysis = analyze_error_patterns(errors)
+
+    assert analysis is not None
+    assert analysis.pattern_type == "kafka_ssl_plaintext_mismatch"
+    assert "sasl_ssl" in analysis.root_cause or "SASL_SSL" in analysis.root_cause
+    assert "security.protocol" in analysis.config_keys
+    assert "bootstrap.servers" in analysis.config_keys
+    assert "10/10" in analysis.summary
+
+
+def test_analyze_error_patterns_returns_none_for_no_errors():
+    assert analyze_error_patterns([]) is None
+
+
+def test_analyze_error_patterns_single_error_not_classified():
+    """A single matching error should not be classified as a recurring pattern."""
+    errors = [_make_kafka_ssl_error(1)]
+
+    analysis = analyze_error_patterns(errors)
+
+    assert analysis is None
+
+
+def test_analyze_error_patterns_returns_none_for_unrecognized_errors():
+    errors = [
+        GrafanaError(
+            key="misc-1",
+            severity="ERROR",
+            title="Some other error",
+            message="IndexOutOfBoundsException at line 42",
+            service="svc",
+            source="grafana",
+        )
+    ]
+
+    analysis = analyze_error_patterns(errors)
+
+    assert analysis is None
+
+
+def test_analyze_error_patterns_majority_threshold():
+    """Pattern must match at least half the errors to be returned."""
+    errors = [_make_kafka_ssl_error(i) for i in range(1, 6)]
+    errors += [
+        GrafanaError(
+            key=f"misc-{i}",
+            severity="ERROR",
+            title="Unrelated",
+            message="NullPointerException",
+            service="svc",
+            source="grafana",
+        )
+        for i in range(6, 11)
+    ]
+
+    # 5 SSL out of 10 – exactly half, should still classify
+    analysis = analyze_error_patterns(errors)
+
+    assert analysis is not None
+    assert analysis.pattern_type == "kafka_ssl_plaintext_mismatch"
+
+
+def test_analyze_error_patterns_kafka_auth_failure():
+    errors = [
+        GrafanaError(
+            key=f"auth-{i}",
+            severity="ERROR",
+            title="SASL authentication failed",
+            message="SASL authentication failed: mechanism not supported by broker",
+            service="svc",
+            source="grafana",
+        )
+        for i in range(3)
+    ]
+
+    analysis = analyze_error_patterns(errors)
+
+    assert analysis is not None
+    assert analysis.pattern_type == "kafka_auth_failure"
+    assert "sasl.mechanism" in analysis.config_keys
+
+
+def test_analyze_error_patterns_kafka_connectivity():
+    errors = [
+        GrafanaError(
+            key=f"conn-{i}",
+            severity="ERROR",
+            title="Broker connection refused",
+            message="Connection refused: broker transport failure after timeout",
+            service="svc",
+            source="grafana",
+        )
+        for i in range(3)
+    ]
+
+    analysis = analyze_error_patterns(errors)
+
+    assert analysis is not None
+    assert analysis.pattern_type == "kafka_connectivity"
+    assert "bootstrap.servers" in analysis.config_keys
+
+
+# ---------------------------------------------------------------------------
+# create_github_issue_for_copilot – root-cause analysis section in issue body
+# ---------------------------------------------------------------------------
+
+def test_github_issue_body_includes_kafka_ssl_root_cause_analysis():
+    from agent.grafana_error_agent import GrafanaErrorAgent
+
+    config = GrafanaAgentConfig(
+        github_owner="test-org",
+        github_repo="test-service",
+    )
+    agent = GrafanaErrorAgent(config)
+
+    errors = [_make_kafka_ssl_error(i) for i in range(1, 11)]
+    issue = agent.create_github_issue_for_copilot(errors)
+
+    body = issue["body"]
+    assert "Root-Cause Analysis" in body
+    assert "kafka_ssl_plaintext_mismatch" in body
+    assert "security.protocol" in body
+    assert "PLAINTEXT" in body
+
+
+def test_github_issue_body_no_analysis_section_for_unrecognized_errors():
+    from agent.grafana_error_agent import GrafanaErrorAgent
+
+    config = GrafanaAgentConfig(
+        github_owner="test-org",
+        github_repo="test-service",
+    )
+    agent = GrafanaErrorAgent(config)
+
+    errors = [
+        GrafanaError(
+            key="x-1",
+            severity="ERROR",
+            title="Random error",
+            message="Something went wrong",
+            service="svc",
+            source="grafana",
+        )
+    ]
+    issue = agent.create_github_issue_for_copilot(errors)
+
+    assert "Root-Cause Analysis" not in issue["body"]
