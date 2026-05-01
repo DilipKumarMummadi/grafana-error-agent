@@ -442,6 +442,138 @@ def normalize_grafana_errors(data: Any, config: GrafanaAgentConfig) -> list[Graf
     return errors[: config.max_errors]
 
 
+_KAFKA_SSL_PATTERN = re.compile(
+    r"SSL handshake failed.*connecting to a PLAINTEXT broker",
+    re.IGNORECASE,
+)
+
+_KAFKA_AUTH_PATTERN = re.compile(
+    r"(SASL|authentication|broker.*not.*configured|mechanism.*not.*supported)",
+    re.IGNORECASE,
+)
+
+_KAFKA_TIMEOUT_PATTERN = re.compile(
+    r"(timeout|timed\s+out|connection refused|broker transport failure|leader not available)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class ErrorPatternAnalysis:
+    """Result of error pattern analysis for a set of Grafana errors."""
+
+    pattern_type: str
+    summary: str
+    root_cause: str
+    suggested_fix: str
+    config_keys: list[str] = field(default_factory=list)
+
+
+def analyze_error_patterns(errors: list[GrafanaError]) -> Optional[ErrorPatternAnalysis]:
+    """Detect recurring error patterns and return a root-cause analysis.
+
+    Returns an :class:`ErrorPatternAnalysis` when all (or a majority of) errors
+    share a recognizable pattern, or ``None`` when the errors are too diverse to
+    classify automatically.
+    """
+    if not errors:
+        return None
+
+    messages = [e.message for e in errors]
+
+    ssl_matches = sum(1 for m in messages if _KAFKA_SSL_PATTERN.search(m))
+    if ssl_matches >= max(2, len(messages) // 2):
+        return ErrorPatternAnalysis(
+            pattern_type="kafka_ssl_plaintext_mismatch",
+            summary=(
+                f"{ssl_matches}/{len(messages)} errors indicate a Kafka client/broker "
+                "TLS protocol mismatch: the client is configured for `sasl_ssl` but the "
+                "broker port accepts PLAINTEXT connections only."
+            ),
+            root_cause=(
+                "The Kafka producer/consumer is connecting with `security.protocol=SASL_SSL` "
+                "(or an `sasl_ssl://` bootstrap URL) while the broker listener on the target "
+                "port is configured for PLAINTEXT.  The SSL handshake is rejected immediately "
+                "because the broker sends a PLAINTEXT frame instead of a TLS ServerHello."
+            ),
+            suggested_fix=(
+                "Choose one of the following fixes and apply it consistently across all "
+                "Kafka client configurations in this service:\n\n"
+                "**Option A – Switch the client to PLAINTEXT** (if the broker port is "
+                "intentionally PLAINTEXT):\n"
+                "```\n"
+                "security.protocol=PLAINTEXT\n"
+                "# Remove or do not set sasl.mechanism / sasl.username / sasl.password\n"
+                "```\n\n"
+                "**Option B – Use the correct SSL/SASL port** (if the broker also exposes "
+                "a TLS listener on a different port, e.g. 9093):\n"
+                "```\n"
+                "bootstrap.servers=<broker-host>:9093\n"
+                "security.protocol=SASL_SSL\n"
+                "```\n\n"
+                "**Option C – Update the bootstrap URL scheme** in code/config to match "
+                "the actual broker protocol:\n"
+                "```\n"
+                "# Before (wrong)\n"
+                "bootstrap.servers=sasl_ssl://<broker>:443\n"
+                "# After (plaintext)\n"
+                "bootstrap.servers=<broker>:443\n"
+                "security.protocol=PLAINTEXT\n"
+                "```\n\n"
+                "After the change, verify connectivity with `kafka-console-producer` or "
+                "the broker's admin API before deploying."
+            ),
+            config_keys=["security.protocol", "bootstrap.servers", "sasl.mechanism"],
+        )
+
+    auth_matches = sum(1 for m in messages if _KAFKA_AUTH_PATTERN.search(m))
+    if auth_matches >= max(2, len(messages) // 2):
+        return ErrorPatternAnalysis(
+            pattern_type="kafka_auth_failure",
+            summary=(
+                f"{auth_matches}/{len(messages)} errors indicate a Kafka SASL "
+                "authentication failure."
+            ),
+            root_cause=(
+                "The Kafka client credentials (username, password, or SASL mechanism) do "
+                "not match what the broker expects.  This is often caused by rotating "
+                "secrets without updating the application configuration, or by selecting "
+                "the wrong SASL mechanism (e.g. PLAIN vs SCRAM-SHA-256)."
+            ),
+            suggested_fix=(
+                "1. Verify `sasl.username` and `sasl.password` match the broker's ACL.\n"
+                "2. Confirm `sasl.mechanism` matches the broker listener setting "
+                "(PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512).\n"
+                "3. Rotate secrets in the deployment environment and restart the service."
+            ),
+            config_keys=["sasl.mechanism", "sasl.username", "sasl.password"],
+        )
+
+    timeout_matches = sum(1 for m in messages if _KAFKA_TIMEOUT_PATTERN.search(m))
+    if timeout_matches >= max(2, len(messages) // 2):
+        return ErrorPatternAnalysis(
+            pattern_type="kafka_connectivity",
+            summary=(
+                f"{timeout_matches}/{len(messages)} errors indicate Kafka broker "
+                "connectivity problems (timeout or connection refused)."
+            ),
+            root_cause=(
+                "The Kafka broker is unreachable from the service.  Common causes: "
+                "incorrect `bootstrap.servers`, firewall rules blocking the broker port, "
+                "or the broker being down/restarting."
+            ),
+            suggested_fix=(
+                "1. Confirm `bootstrap.servers` points to the correct hostnames and ports.\n"
+                "2. Check network policies / firewall rules between the service and broker.\n"
+                "3. Verify the Kafka broker pods/VMs are healthy and reachable.\n"
+                "4. Review broker logs for split-brain or leader-election events."
+            ),
+            config_keys=["bootstrap.servers"],
+        )
+
+    return None
+
+
 def _schema_properties(schema: Any) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return {}
@@ -902,6 +1034,25 @@ The Grafana MCP server reported runtime errors for this repository/service. Fix 
             for index, pattern in enumerate(patterns[: self.config.max_errors], 1):
                 body += f"{index}. `{str(pattern)[:500]}`\n"
             body += "\n"
+
+        analysis = analyze_error_patterns(errors)
+        if analysis:
+            body += f"""## Root-Cause Analysis
+
+**Detected pattern:** `{analysis.pattern_type}`
+
+**Summary:** {analysis.summary}
+
+**Root cause:** {analysis.root_cause}
+
+**Suggested fix:**
+
+{analysis.suggested_fix}
+
+"""
+            if analysis.config_keys:
+                keys_str = ", ".join(f"`{k}`" for k in analysis.config_keys)
+                body += f"**Configuration keys to review:** {keys_str}\n\n"
 
         body += """## Instructions for @copilot
 
